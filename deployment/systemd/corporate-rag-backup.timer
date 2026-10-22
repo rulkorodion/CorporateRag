@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Corporate RAG backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=30min
+AccuracySec=1min
+Unit=corporate-rag-backup.service
+
+[Install]
+WantedBy=timers.target

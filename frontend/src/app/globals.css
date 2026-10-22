@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --background: #fbfcfe;
+  --foreground: #294c64;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Manrope Variable", Manrope, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+textarea,
+input,
+select {
+  font: inherit;
+}
+
+.answer-card {
+  width: 100%;
+  border: 1px solid #d7e2e7;
+  border-radius: 30px;
+  background: rgba(247, 250, 251, 0.96);
+  padding: 32px 38px 35px;
+  box-shadow: 0 12px 36px rgba(55, 86, 108, 0.08);
+}
+
+.answer-markdown {
+  color: #294c64;
+  font-size: 16px;
+  line-height: 1.85;
+}
+
+.answer-markdown > :first-child {
+  margin-top: 0;
+}
+
+.answer-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.answer-markdown p,
+.answer-markdown ul,
+.answer-markdown ol,
+.answer-markdown table,
+.answer-markdown blockquote {
+  margin: 0 0 1.35em;
+}
+
+.answer-markdown h1,
+.answer-markdown h2,
+.answer-markdown h3,
+.answer-markdown h4 {
+  margin: 1.5em 0 0.65em;
+  color: #294c64;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.answer-markdown h2 {
+  font-size: 1.15em;
+}
+
+.answer-markdown h3,
+.answer-markdown h4 {
+  font-size: 1.05em;
+}
+
+.answer-markdown ul,
+.answer-markdown ol {
+  padding-left: 1.45rem;
+}
+
+.answer-markdown li {
+  margin: 0.35em 0;
+  padding-left: 0.2rem;
+}
+
+.answer-markdown strong {
+  font-weight: 700;
+  color: #294c64;
+}
+
+.answer-markdown table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.answer-markdown th,
+.answer-markdown td {
+  min-width: 130px;
+  border: 1px solid #dfe6f0;
+  padding: 9px 11px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.answer-markdown th {
+  background: #edf3f6;
+  font-weight: 650;
+}
+
+.composer-shell {
+  background: linear-gradient(180deg, rgba(250, 252, 253, 0), rgba(250, 252, 253, 0.92) 32%, #fafcfd 70%);
+}
+
+@media (max-width: 639px) {
+  .answer-card {
+    border-radius: 26px;
+    padding: 25px 21px 27px;
+  }
+
+  .answer-markdown {
+    font-size: 15px;
+    line-height: 1.75;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

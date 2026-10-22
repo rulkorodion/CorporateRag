@@ -1,0 +1,16 @@
+[Unit]
+Description=Validate Corporate RAG uploads and run incremental update
+Requires=docker.service
+After=docker.service corporate-rag.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/corporate-rag-promote-uploads
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+

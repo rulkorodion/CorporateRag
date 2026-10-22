@@ -1,0 +1,20 @@
+[Unit]
+Description=Corporate RAG production startup and recovery check
+Requires=docker.service
+After=docker.service network-online.target ollama.service
+Wants=network-online.target ollama.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/corporate-rag-start
+RemainAfterExit=yes
+TimeoutStartSec=15min
+Restart=on-failure
+RestartSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch Corporate RAG editor upload queue
+
+[Path]
+PathExistsGlob=/opt/corporate-rag/admin-upload/queue/*/request.json
+PathExists=/opt/corporate-rag/admin-upload/trigger/update.request
+Unit=corporate-rag-upload.service
+
+[Install]
+WantedBy=multi-user.target
+

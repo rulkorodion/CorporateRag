@@ -1,0 +1,15 @@
+[Unit]
+Description=Corporate RAG production backup
+Requires=docker.service
+After=docker.service corporate-rag.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/corporate-rag-backup
+TimeoutStartSec=2h
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+

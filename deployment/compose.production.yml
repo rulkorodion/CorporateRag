@@ -1,0 +1,247 @@
+name: corporate-rag-production
+
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  rag-index:
+    image: corporate-rag-api:0.4.12-stage15-private-schedules
+    profiles: ["index"]
+    network_mode: host
+    env_file:
+      - ${CORPORATE_RAG_ENV_FILE:-/opt/corporate-rag/config/production.env}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
+    volumes:
+      - /opt/corporate-rag/storage/chunks:/app/storage/chunks:ro
+      - /opt/models/Qwen3-Embedding-0.6B:/models/embedding:ro
+      - /opt/models/Qdrant-bm25-cache:/models/sparse-cache:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    command: ["python", "/app/tools/index_production.py"]
+    restart: "no"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    logging: *default-logging
+
+  rag-api:
+    image: corporate-rag-api:0.4.12-stage15-private-schedules
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+      args:
+        BASE_IMAGE: specification-checker-worker:0.1.4-stage6.20260806
+    container_name: corporate-rag-api
+    network_mode: host
+    env_file:
+      - ${CORPORATE_RAG_ENV_FILE:-/opt/corporate-rag/config/production.env}
+    environment:
+      API_HOST: 127.0.0.1
+      API_PORT: "8010"
+      API_TELEMETRY_STORAGE_ENABLED: "true"
+      API_TELEMETRY_DATABASE_PATH: /app/storage/telemetry/requests.db
+      API_TELEMETRY_RETENTION_DAYS: "90"
+      ROLLING_SCHEDULE_ENABLED: "true"
+      ROLLING_SCHEDULE_ROOT: /app/storage/rolling-schedules
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
+    volumes:
+      - /opt/corporate-rag/storage/chunks:/app/storage/chunks:ro
+      - /opt/corporate-rag/storage/normalized:/app/storage/normalized:ro
+      - /opt/corporate-rag/storage/assets:/app/storage/assets:ro
+      - /opt/corporate-rag/storage/telemetry:/app/storage/telemetry:rw
+      - /opt/corporate-rag/storage/rolling-schedules:/app/storage/rolling-schedules:ro
+      - /opt/corporate-rag/knowledge-base:/app/knowledge-base:ro
+      - /opt/models/Qwen3-Embedding-0.6B:/models/embedding:ro
+      - /opt/models/Qwen3-Reranker-0.6B:/models/reranker:ro
+      - /opt/models/Qdrant-bm25-cache:/models/sparse-cache:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    logging: *default-logging
+    stop_grace_period: 60s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8010/ready', timeout=5)); raise SystemExit(0 if data.get('ready') else 1)"
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+      retries: 3
+
+  rag-update:
+    image: corporate-rag-updater:0.1.4-stage15-rolling
+    profiles: ["update"]
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.update
+      args:
+        BASE_IMAGE: corporate-rag-api:0.4.12-stage15-private-schedules
+    network_mode: host
+    env_file:
+      - ${CORPORATE_RAG_ENV_FILE:-/opt/corporate-rag/config/production.env}
+    environment:
+      HOME: /tmp
+      DOCLING_ARTIFACTS_PATH: /models/docling
+      HF_MODULES_CACHE: /app/storage/cache/monkeyocr/huggingface_modules
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "1"
+      ROLLING_SCHEDULE_ENABLED: "true"
+      ROLLING_SCHEDULE_ROOT: /app/storage/rolling-schedules
+    volumes:
+      - /opt/corporate-rag/storage:/app/storage:rw
+      - /opt/corporate-rag/knowledge-base:/app/knowledge-base:ro
+      - /opt/corporate-rag/app/config:/app/config:ro
+      - /opt/models/Qwen3-Embedding-0.6B:/models/embedding:ro
+      - /opt/models/Qdrant-bm25-cache:/models/sparse-cache:ro
+      - /opt/models/MonkeyOCRv2-B-Parsing:/models/huggingface:ro
+      - /opt/models/Docling:/models/docling:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    command: ["python", "-m", "corporate_rag_ingestion", "update", "--json"]
+    restart: "no"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    logging: *default-logging
+
+  onlyoffice:
+    image: onlyoffice/documentserver:9.3.0
+    container_name: corporate-rag-onlyoffice
+    env_file:
+      - ${CORPORATE_RAG_ENV_FILE:-/opt/corporate-rag/config/production.env}
+    environment:
+      JWT_ENABLED: "true"
+      ALLOW_PRIVATE_IP_ADDRESS: "true"
+      ALLOW_META_IP_ADDRESS: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8082:80"
+    volumes:
+      - /opt/corporate-rag/onlyoffice/logs:/var/log/onlyoffice
+      - /opt/corporate-rag/onlyoffice/data:/var/www/onlyoffice/Data
+      - /opt/corporate-rag/onlyoffice/lib:/var/lib/onlyoffice
+      - /opt/corporate-rag/onlyoffice/db:/var/lib/postgresql
+    restart: unless-stopped
+    shm_size: "2gb"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 5
+
+  rag-frontend:
+    image: corporate-rag-frontend:0.5.9-stage15-private-schedules
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: corporate-rag-frontend
+    network_mode: host
+    env_file:
+      - ${CORPORATE_RAG_ADMIN_ENV_FILE:-/opt/corporate-rag/config/admin.env}
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 127.0.0.1
+      PORT: "3002"
+      RAG_API_URL: http://127.0.0.1:8010
+      RAG_API_TIMEOUT_MS: "450000"
+    volumes:
+      - /opt/corporate-rag/admin-upload:/app/admin-upload:rw
+      - /opt/corporate-rag/knowledge-base:/app/knowledge-base:ro
+    depends_on:
+      rag-api:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m
+      - /app/.next/cache:rw,nosuid,nodev,size=256m,uid=1001,gid=1001,mode=0750
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    logging: *default-logging
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3002/api/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  rag-gateway:
+    image: nginx:1.29-alpine
+    container_name: corporate-rag-gateway
+    network_mode: host
+    volumes:
+      - /opt/corporate-rag/app/deployment/nginx.production.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      rag-frontend:
+        condition: service_healthy
+      onlyoffice:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,nosuid,nodev,size=128m
+      - /var/run:rw,nosuid,nodev,size=16m
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "SETGID", "SETUID", "NET_BIND_SERVICE"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3001/api/ready"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3

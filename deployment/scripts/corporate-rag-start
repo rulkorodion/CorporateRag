@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+APP_ROOT="${CORPORATE_RAG_APP_ROOT:-/opt/corporate-rag/app}"
+COMPOSE_FILE="${CORPORATE_RAG_COMPOSE_FILE:-$APP_ROOT/deployment/compose.production.yml}"
+
+wait_for_url() {
+  local name="$1"
+  local url="$2"
+  local timeout_seconds="$3"
+  local deadline=$((SECONDS + timeout_seconds))
+  until curl -fsS --connect-timeout 3 --max-time 10 "$url" >/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "ERROR: timed out waiting for $name at $url" >&2
+      return 1
+    fi
+    sleep 3
+  done
+  echo "$name is reachable"
+}
+
+wait_for_url "Qdrant" "http://127.0.0.1:6333/" 180
+wait_for_url "Ollama" "http://127.0.0.1:11434/api/tags" 180
+
+/usr/bin/docker compose --ansi never \
+  -f "$COMPOSE_FILE" \
+  up -d --no-build onlyoffice rag-api rag-frontend rag-gateway
+
+wait_for_url "ONLYOFFICE" "http://127.0.0.1:8082/healthcheck" 360
+
+if ! wait_for_url "RAG API readiness" "http://127.0.0.1:8010/ready" 360; then
+  echo "API was not ready after dependency recovery; restarting it once" >&2
+  /usr/bin/docker compose --ansi never -f "$COMPOSE_FILE" restart rag-api
+  wait_for_url "RAG API readiness after restart" "http://127.0.0.1:8010/ready" 360
+fi
+
+wait_for_url "RAG frontend" "http://127.0.0.1:3001/api/ready" 120
+echo "Corporate RAG startup/recovery check completed"

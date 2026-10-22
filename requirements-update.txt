@@ -1,0 +1,7 @@
+# Additional dependencies used only by the opt-in Stage 11 updater image.
+# CUDA/PyTorch, retrieval and API dependencies come from the Stage 11 API image.
+docling>=2.118,<3
+openpyxl>=3.1,<4
+pillow>=10,<13
+pymupdf>=1.24,<2
+sqlalchemy>=2.0,<3

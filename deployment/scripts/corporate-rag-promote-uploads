@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import tempfile
+import time
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ADMIN_ROOT = Path(os.environ.get("CORPORATE_RAG_ADMIN_UPLOAD_ROOT", "/opt/corporate-rag/admin-upload"))
+KNOWLEDGE_ROOT = Path(os.environ.get("CORPORATE_RAG_KNOWLEDGE_ROOT", "/opt/corporate-rag/knowledge-base"))
+UPDATE_COMMAND = os.environ.get("CORPORATE_RAG_UPDATE_COMMAND", "/usr/local/sbin/corporate-rag-update")
+LOCK_FILE = Path(os.environ.get("CORPORATE_RAG_MAINTENANCE_LOCK", "/run/lock/corporate-rag-maintenance.lock"))
+DEBOUNCE_SECONDS = max(0, int(os.environ.get("ADMIN_UPLOAD_DEBOUNCE_SECONDS", "30")))
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".rtf", ".xlsx", ".png", ".jpg", ".jpeg", ".mp4"}
+MAX_UPLOAD_BYTES = max(1, int(os.environ.get("ADMIN_MAX_UPLOAD_BYTES", "104857600")))
+MAX_ARCHIVE_ENTRIES = max(1, int(os.environ.get("ADMIN_MAX_ARCHIVE_ENTRIES", "20000")))
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = max(
+    1,
+    int(os.environ.get("ADMIN_MAX_ARCHIVE_UNCOMPRESSED_BYTES", "1073741824")),
+)
+UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.chmod(temporary_name, 0o644)
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def read_json(path: Path) -> dict[str, object]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("JSON object expected")
+    return data
+
+
+def update_job(job_id: str, **changes: object) -> None:
+    path = ADMIN_ROOT / "jobs" / f"{job_id}.json"
+    try:
+        job = read_json(path)
+    except Exception:
+        job = {"id": job_id, "createdAt": utc_now()}
+    job.update(changes)
+    job["updatedAt"] = utc_now()
+    atomic_json(path, job)
+
+
+def validate_segment(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} is missing")
+    normalized = value.strip()
+    if not normalized or normalized in {".", ".."} or len(normalized) > 180:
+        raise ValueError(f"invalid {label}")
+    if any(character in normalized for character in "/\\\x00") or any(ord(character) < 32 for character in normalized):
+        raise ValueError(f"invalid {label}")
+    return normalized
+
+
+def validate_payload_content(payload: Path, extension: str) -> None:
+    with payload.open("rb") as stream:
+        header = stream.read(16)
+    valid = {
+        ".pdf": header.startswith(b"%PDF-"),
+        ".png": header.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".jpg": header.startswith(b"\xff\xd8\xff"),
+        ".jpeg": header.startswith(b"\xff\xd8\xff"),
+        ".doc": header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),
+        ".rtf": header.lower().startswith(b"{\\rtf"),
+        ".mp4": len(header) >= 8 and header[4:8] == b"ftyp",
+        ".docx": header.startswith(b"PK"),
+        ".xlsx": header.startswith(b"PK"),
+    }.get(extension, False)
+    if not valid:
+        raise ValueError("file content does not match extension")
+    if extension not in {".docx", ".xlsx"}:
+        return
+    required_entry = "word/document.xml" if extension == ".docx" else "xl/workbook.xml"
+    try:
+        with zipfile.ZipFile(payload) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_ARCHIVE_ENTRIES:
+                raise ValueError("office archive contains too many entries")
+            if any(entry.flag_bits & 0x1 for entry in entries):
+                raise ValueError("encrypted office archives are not supported")
+            if sum(entry.file_size for entry in entries) > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                raise ValueError("office archive is too large when unpacked")
+            if required_entry not in {entry.filename for entry in entries}:
+                raise ValueError("invalid office document structure")
+            damaged = archive.testzip()
+            if damaged is not None:
+                raise ValueError(f"damaged office archive entry: {damaged}")
+    except zipfile.BadZipFile as error:
+        raise ValueError("invalid office archive") from error
+
+
+def validate_request(job_directory: Path) -> tuple[dict[str, object], Path, Path, str]:
+    job_id = job_directory.name
+    if not UUID_PATTERN.fullmatch(job_id):
+        raise ValueError("invalid job id")
+    request_path = job_directory / "request.json"
+    payload_path = job_directory / "payload"
+    if request_path.is_symlink() or payload_path.is_symlink():
+        raise ValueError("symbolic links are not allowed")
+    payload_stat = payload_path.stat()
+    if not stat.S_ISREG(payload_stat.st_mode):
+        raise ValueError("payload is not a regular file")
+    request = read_json(request_path)
+    if request.get("id") != job_id:
+        raise ValueError("job id mismatch")
+    file_name = validate_segment(request.get("fileName"), "file name")
+    if file_name.startswith((".", "~$")):
+        raise ValueError("invalid file name")
+    extension = Path(file_name).suffix.casefold()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise ValueError("unsupported extension")
+    category_value = request.get("category")
+    if not isinstance(category_value, str):
+        raise ValueError("category is missing")
+    category_parts = [validate_segment(part, "category") for part in category_value.replace("\\", "/").split("/") if part]
+    if not category_parts or len(category_parts) > 6:
+        raise ValueError("invalid category")
+    relative_path = "/".join([*category_parts, file_name])
+    if request.get("relativePath") != relative_path:
+        raise ValueError("relative path mismatch")
+    expected_size = request.get("sizeBytes")
+    if not isinstance(expected_size, int) or payload_stat.st_size != expected_size:
+        raise ValueError("payload size mismatch")
+    if payload_stat.st_size <= 0 or payload_stat.st_size > MAX_UPLOAD_BYTES:
+        raise ValueError("payload size is outside allowed limits")
+    expected_sha = request.get("sha256")
+    actual_sha = hashlib.sha256(payload_path.read_bytes()).hexdigest()
+    if not isinstance(expected_sha, str) or actual_sha != expected_sha:
+        raise ValueError("payload checksum mismatch")
+    validate_payload_content(payload_path, extension)
+    root = KNOWLEDGE_ROOT.resolve()
+    destination = root.joinpath(*category_parts, file_name)
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if root not in destination.parent.resolve().parents and destination.parent.resolve() != root:
+        raise ValueError("destination escapes knowledge root")
+    if destination.exists() and not bool(request.get("replace")):
+        raise FileExistsError("Файл с таким именем уже существует.")
+    return request, payload_path, destination, relative_path
+
+
+def promote_jobs() -> list[tuple[str, str]]:
+    promoted: list[tuple[str, str]] = []
+    queue_root = ADMIN_ROOT / "queue"
+    for job_directory in sorted(queue_root.iterdir()) if queue_root.is_dir() else []:
+        if not job_directory.is_dir() or job_directory.is_symlink():
+            continue
+        job_id = job_directory.name
+        try:
+            _request, payload, destination, relative_path = validate_request(job_directory)
+            try:
+                os.replace(payload, destination)
+            except OSError:
+                temporary = destination.with_name(f".{destination.name}.{job_id}.tmp")
+                shutil.copyfile(payload, temporary)
+                os.chmod(temporary, 0o644)
+                os.replace(temporary, destination)
+                payload.unlink()
+            os.chmod(destination, 0o644)
+            update_job(
+                job_id,
+                status="processing",
+                message="Файл проверен. Выполняется обновление поискового индекса.",
+                relativePath=relative_path,
+            )
+            promoted.append((job_id, relative_path))
+            shutil.rmtree(job_directory)
+        except Exception as error:
+            if UUID_PATTERN.fullmatch(job_id):
+                update_job(job_id, status="error", message=f"Файл отклонён: {error}")
+            shutil.rmtree(job_directory, ignore_errors=True)
+    return promoted
+
+
+def decode_result(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    start = text.find("{")
+    if start < 0:
+        return {}
+    result, _ = json.JSONDecoder().raw_decode(text[start:])
+    return result if isinstance(result, dict) else {}
+
+
+def finish_jobs(batch: list[tuple[str, str]], result: dict[str, object], return_code: int) -> None:
+    files = result.get("files")
+    indexed = {
+        item.get("relative_path"): item
+        for item in files
+        if isinstance(item, dict) and isinstance(item.get("relative_path"), str)
+    } if isinstance(files, list) else {}
+    for job_id, relative_path in batch:
+        item = indexed.get(relative_path)
+        if isinstance(item, dict) and item.get("status") == "failed":
+            update_job(job_id, status="error", message=str(item.get("error") or "Не удалось обработать документ."))
+        elif return_code == 0:
+            chunks = item.get("chunks_created") if isinstance(item, dict) else None
+            suffix = f" Создано chunks: {chunks}." if isinstance(chunks, int) else ""
+            update_job(job_id, status="indexed", message=f"Документ добавлен в базу знаний.{suffix}")
+        else:
+            update_job(job_id, status="error", message="Обновление завершилось с ошибкой. Файл сохранён и будет повторно обработан.")
+
+
+def main() -> int:
+    for directory in (ADMIN_ROOT / "queue", ADMIN_ROOT / "jobs", ADMIN_ROOT / "trigger", ADMIN_ROOT / "runtime"):
+        directory.mkdir(parents=True, exist_ok=True)
+    trigger = ADMIN_ROOT / "trigger" / "update.request"
+    immediate = trigger.exists()
+    if not immediate and DEBOUNCE_SECONDS:
+        deadline = time.monotonic() + DEBOUNCE_SECONDS
+        while time.monotonic() < deadline:
+            if trigger.exists():
+                immediate = True
+                break
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        immediate = immediate or trigger.exists()
+        trigger.unlink(missing_ok=True)
+        batch = promote_jobs()
+        if not batch and not immediate:
+            return 0
+        started = utc_now()
+        atomic_json(
+            ADMIN_ROOT / "runtime" / "update-status.json",
+            {"status": "running", "message": "Выполняется инкрементальное обновление.", "startedAt": started},
+        )
+        result_path = ADMIN_ROOT / "runtime" / "last-update-result.json"
+        environment = os.environ.copy()
+        environment["CORPORATE_RAG_LOCK_HELD"] = "1"
+        environment["CORPORATE_RAG_RESULT_FILE"] = str(result_path)
+        completed = subprocess.run([UPDATE_COMMAND], env=environment, check=False)
+        try:
+            result = decode_result(result_path)
+        except Exception:
+            result = {}
+        finish_jobs(batch, result, completed.returncode)
+        finished = utc_now()
+        if completed.returncode == 0:
+            changed = sum(int(result.get(field, 0) or 0) for field in ("new", "changed", "deleted"))
+            state = {
+                "status": "success",
+                "message": f"Обновление завершено. Изменённых документов: {changed}.",
+                "startedAt": started,
+                "finishedAt": finished,
+            }
+        else:
+            state = {
+                "status": "error",
+                "message": "Обновление завершилось с ошибкой. Рабочие версии документов сохранены.",
+                "startedAt": started,
+                "finishedAt": finished,
+            }
+        atomic_json(ADMIN_ROOT / "runtime" / "update-status.json", state)
+        return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+APP_ROOT="${CORPORATE_RAG_APP_ROOT:-/opt/corporate-rag/app}"
+COMPOSE_FILE="${CORPORATE_RAG_COMPOSE_FILE:-$APP_ROOT/deployment/compose.production.yml}"
+REPORT_ROOT="${CORPORATE_RAG_REPORT_ROOT:-/opt/corporate-rag/storage/reports/incremental}"
+REPORT_RETENTION="${INCREMENTAL_REPORT_RETENTION:-168}"
+LOCK_FILE="${CORPORATE_RAG_MAINTENANCE_LOCK:-/run/lock/corporate-rag-maintenance.lock}"
+
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+  echo "ERROR: Compose file not found: $COMPOSE_FILE" >&2
+  exit 2
+fi
+if ! [[ "$REPORT_RETENTION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: INCREMENTAL_REPORT_RETENTION must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ "${CORPORATE_RAG_LOCK_HELD:-0}" != "1" ]]; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "Incremental update skipped: another maintenance job is active"
+    exit 0
+  fi
+fi
+
+output_file="$(mktemp /tmp/corporate-rag-update.XXXXXX.json)"
+rolling_output_file="$(mktemp /tmp/corporate-rag-rolling-update.XXXXXX.json)"
+trap 'rm -f -- "$output_file" "$rolling_output_file"' EXIT
+
+started="$(date --iso-8601=seconds)"
+echo "Incremental update started at $started"
+
+# The existing hourly maintenance timer is also the retry mechanism for the
+# daily rolling-schedule download. The command itself skips while the last
+# successful snapshot is younger than 24 hours.
+set +e
+/usr/bin/docker compose --ansi never \
+  -f "$COMPOSE_FILE" \
+  --profile update \
+  run --rm rag-update \
+  python -m corporate_rag_ingestion rolling-sync --json \
+  >"$rolling_output_file"
+rolling_status=$?
+set -e
+
+if [[ $rolling_status -eq 0 ]]; then
+  python3 - "$rolling_output_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.find("{")
+if start < 0:
+    raise SystemExit("Rolling schedule updater returned no JSON report")
+report, _ = json.JSONDecoder().raw_decode(text[start:])
+print("Rolling schedule update summary:")
+for field in (
+    "status", "changed", "sheets", "records", "products",
+    "service_events", "formula_errors", "sha256", "skipped_reason",
+):
+    print(f"  {field}={report.get(field)}")
+PY
+else
+  echo "Rolling schedule update failed with exit code $rolling_status; last good snapshot is preserved" >&2
+  tail -100 "$rolling_output_file" >&2 || true
+fi
+
+set +e
+/usr/bin/docker compose --ansi never \
+  -f "$COMPOSE_FILE" \
+  --profile update \
+  run --rm rag-update \
+  python -m corporate_rag_ingestion update --json \
+  >"$output_file"
+status=$?
+set -e
+
+if [[ -n "${CORPORATE_RAG_RESULT_FILE:-}" ]]; then
+  install -D -m 0644 "$output_file" "$CORPORATE_RAG_RESULT_FILE"
+fi
+
+if [[ $status -ne 0 ]]; then
+  echo "Incremental update failed with exit code $status" >&2
+  tail -100 "$output_file" >&2 || true
+  exit "$status"
+fi
+
+python3 - "$output_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.find("{")
+if start < 0:
+    raise SystemExit("Updater returned no JSON report")
+report, _ = json.JSONDecoder().raw_decode(text[start:])
+fields = (
+    "scanned", "new", "changed", "deleted", "unchanged", "normalized",
+    "ocr_pages_processed", "ocr_pages_reused", "chunks_created",
+    "chunks_removed", "embeddings_calculated", "embeddings_reused",
+    "qdrant_points_added", "qdrant_points_removed", "error_count",
+    "elapsed_seconds", "report_path",
+)
+print("Incremental update summary:")
+for field in fields:
+    print(f"  {field}={report.get(field)}")
+for error in report.get("errors", []):
+    print(f"  error={error}")
+if report.get("error_count", len(report.get("errors", []))):
+    raise SystemExit("Incremental update completed with file errors")
+PY
+
+python3 - "$REPORT_ROOT" "$REPORT_RETENTION" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+retention = int(sys.argv[2])
+if root.is_dir():
+    reports = sorted(root.glob("incremental-update-*.json"), reverse=True)
+    for report in reports[retention:]:
+        if report.parent == root and report.is_file():
+            report.unlink()
+PY
+
+echo "Incremental update finished at $(date --iso-8601=seconds)"
+
+if [[ $rolling_status -ne 0 ]]; then
+  exit "$rolling_status"
+fi

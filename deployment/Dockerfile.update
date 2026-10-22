@@ -1,0 +1,28 @@
+ARG BASE_IMAGE=corporate-rag-api:0.1.2-stage11
+FROM ${BASE_IMAGE}
+
+USER root
+
+WORKDIR /build
+COPY requirements-update.txt pyproject.toml README.md ./
+RUN python -m pip install --no-cache-dir -r requirements-update.txt
+
+COPY src ./src
+RUN python -m pip install --no-cache-dir --no-deps . \
+    && python -c "import docling, openpyxl, pymupdf, sqlalchemy, corporate_rag_ingestion.incremental.service" \
+    && rm -rf /build
+
+WORKDIR /app
+COPY config /app/config
+RUN mkdir -p /app/storage /app/knowledge-base \
+    && chown -R app:app /app
+
+USER app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false
+
+CMD ["python", "-m", "corporate_rag_ingestion", "update", "--json"]

@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 0077
+
+usage() {
+  cat <<'EOF'
+Usage:
+  corporate-rag-restore verify BACKUP_DIRECTORY
+  corporate-rag-restore test BACKUP_DIRECTORY [TEST_COLLECTION]
+  corporate-rag-restore production BACKUP_DIRECTORY --confirm-production
+EOF
+}
+
+mode="${1:-}"
+backup_input="${2:-}"
+if [[ -z "$mode" || -z "$backup_input" ]]; then
+  usage >&2
+  exit 2
+fi
+
+backup_dir="$(realpath -e "$backup_input")"
+if [[ ! -d "$backup_dir" || ! -f "$backup_dir/SHA256SUMS" ]]; then
+  echo "ERROR: invalid backup directory: $backup_dir" >&2
+  exit 2
+fi
+
+QDRANT_URL="${QDRANT_URL:-http://127.0.0.1:6333}"
+PRODUCTION_COLLECTION="${QDRANT_COLLECTION:-corporate_knowledge_chunks_v1}"
+RAG_ROOT="${CORPORATE_RAG_ROOT:-/opt/corporate-rag}"
+APP_ROOT="${CORPORATE_RAG_APP_ROOT:-$RAG_ROOT/app}"
+LOCK_FILE="${CORPORATE_RAG_MAINTENANCE_LOCK:-/run/lock/corporate-rag-maintenance.lock}"
+RUNTIME_UID="${CORPORATE_RAG_RUNTIME_UID:-10001}"
+RUNTIME_GID="${CORPORATE_RAG_RUNTIME_GID:-10001}"
+OPERATOR_UID="${CORPORATE_RAG_OPERATOR_UID:-1001}"
+OPERATOR_GID="${CORPORATE_RAG_OPERATOR_GID:-1001}"
+
+curl_args=(-fsS --connect-timeout 10 --max-time 1800)
+if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+  curl_args+=(-H "api-key: ${QDRANT_API_KEY}")
+fi
+
+verify_backup() {
+  (
+    cd "$backup_dir"
+    sha256sum -c SHA256SUMS
+  )
+  python3 - "$backup_dir/document_registry.db" <<'PY'
+import sqlite3, sys
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+result = connection.execute("PRAGMA integrity_check").fetchone()[0]
+connection.close()
+if result != "ok":
+    raise SystemExit(f"Registry integrity check failed: {result}")
+print("Registry integrity: ok")
+PY
+  tar -tzf "$backup_dir/runtime-data.tar.gz" >/dev/null
+  tar -tzf "$backup_dir/knowledge-base.tar.gz" >/dev/null
+  tar -tzf "$backup_dir/config.tar.gz" >/dev/null
+  echo "Backup verification: OK"
+}
+
+verify_backup
+if [[ "$mode" == "verify" ]]; then
+  exit 0
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -w 3600 9; then
+  echo "ERROR: timed out waiting for the maintenance lock" >&2
+  exit 1
+fi
+
+if [[ "$mode" == "test" ]]; then
+  default_test="${PRODUCTION_COLLECTION}_restore_test_$(date -u +%Y%m%d%H%M%S)"
+  test_collection="${3:-$default_test}"
+  if [[ ! "$test_collection" =~ ^${PRODUCTION_COLLECTION}_restore_test_[0-9]+$ ]]; then
+    echo "ERROR: test collection must use ${PRODUCTION_COLLECTION}_restore_test_<digits>" >&2
+    exit 2
+  fi
+
+  workdir="$(mktemp -d /tmp/corporate-rag-restore-test.XXXXXX)"
+  cleanup_test() {
+    curl "${curl_args[@]}" -X DELETE \
+      "$QDRANT_URL/collections/$test_collection" >/dev/null 2>&1 || true
+    rm -rf -- "$workdir"
+  }
+  trap cleanup_test EXIT
+
+  tar -xzf "$backup_dir/runtime-data.tar.gz" -C "$workdir"
+  tar -xzf "$backup_dir/knowledge-base.tar.gz" -C "$workdir"
+  tar -xzf "$backup_dir/config.tar.gz" -C "$workdir"
+
+  curl "${curl_args[@]}" -X POST \
+    "$QDRANT_URL/collections/$test_collection/snapshots/upload?wait=true&priority=snapshot" \
+    -F "snapshot=@$backup_dir/qdrant.snapshot" \
+    -o "$workdir/qdrant-restore.json"
+
+  restored_points="$(curl "${curl_args[@]}" \
+    "$QDRANT_URL/collections/$test_collection" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["result"]["points_count"])')"
+  expected_points="$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["qdrant_points"])' \
+    "$backup_dir/manifest.json")"
+  if [[ "$restored_points" != "$expected_points" ]]; then
+    echo "ERROR: restored points $restored_points != expected $expected_points" >&2
+    exit 1
+  fi
+  echo "Restore test: OK; collection=$test_collection points=$restored_points"
+  exit 0
+fi
+
+if [[ "$mode" != "production" || "${3:-}" != "--confirm-production" ]]; then
+  usage >&2
+  exit 2
+fi
+
+for container in corporate-rag-api corporate-rag-frontend; do
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
+    echo "ERROR: stop corporate-rag-api and corporate-rag-frontend before production restore" >&2
+    exit 1
+  fi
+done
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+staging="$(mktemp -d "$RAG_ROOT/.restore-staging-$stamp.XXXXXX")"
+rollback="$RAG_ROOT/restore-rollback/$stamp"
+mkdir -p "$rollback/storage"
+
+switched=0
+restore_completed=0
+rollback_filesystem() {
+  local status=$?
+  if [[ $status -ne 0 && $switched -eq 1 && $restore_completed -eq 0 ]]; then
+    set +e
+    echo "ERROR: restore failed; rolling runtime files back" >&2
+    mkdir -p "$rollback/failed-restored/storage"
+    for directory in normalized chunks assets ocr; do
+      if [[ -e "$RAG_ROOT/storage/$directory" ]]; then
+        mv "$RAG_ROOT/storage/$directory" \
+          "$rollback/failed-restored/storage/$directory"
+      fi
+      if [[ -e "$rollback/storage/$directory" ]]; then
+        mv "$rollback/storage/$directory" "$RAG_ROOT/storage/$directory"
+      fi
+    done
+    if [[ -e "$RAG_ROOT/storage/document_registry.db" ]]; then
+      mv "$RAG_ROOT/storage/document_registry.db" \
+        "$rollback/failed-restored/document_registry.db"
+    fi
+    if [[ -e "$rollback/storage/document_registry.db" ]]; then
+      mv "$rollback/storage/document_registry.db" \
+        "$RAG_ROOT/storage/document_registry.db"
+    fi
+    for directory in knowledge-base config; do
+      if [[ -e "$RAG_ROOT/$directory" ]]; then
+        mv "$RAG_ROOT/$directory" "$rollback/failed-restored/$directory"
+      fi
+      if [[ -e "$rollback/$directory" ]]; then
+        mv "$rollback/$directory" "$RAG_ROOT/$directory"
+      fi
+    done
+    if [[ -f "$rollback/compose.production.yml" ]]; then
+      cp "$rollback/compose.production.yml" \
+        "$APP_ROOT/deployment/compose.production.yml"
+    fi
+    chown -R "$RUNTIME_UID:$RUNTIME_GID" "$RAG_ROOT/storage"
+    chown -R "$OPERATOR_UID:$OPERATOR_GID" \
+      "$RAG_ROOT/knowledge-base" "$RAG_ROOT/config"
+  fi
+  if [[ -d "$staging" ]]; then
+    rm -rf -- "$staging"
+  fi
+  exit "$status"
+}
+trap rollback_filesystem EXIT
+
+tar -xzf "$backup_dir/runtime-data.tar.gz" -C "$staging"
+tar -xzf "$backup_dir/knowledge-base.tar.gz" -C "$staging"
+tar -xzf "$backup_dir/config.tar.gz" -C "$staging"
+cp "$backup_dir/document_registry.db" "$staging/document_registry.db"
+
+for required in normalized chunks assets ocr; do
+  test -d "$RAG_ROOT/storage/$required"
+  test -d "$staging/storage/$required"
+done
+test -f "$RAG_ROOT/storage/document_registry.db"
+test -d "$RAG_ROOT/knowledge-base"
+test -d "$RAG_ROOT/config"
+test -f "$staging/deployment/compose.production.yml"
+
+switched=1
+for directory in normalized chunks assets ocr; do
+  mv "$RAG_ROOT/storage/$directory" "$rollback/storage/$directory"
+  mv "$staging/storage/$directory" "$RAG_ROOT/storage/$directory"
+done
+mv "$RAG_ROOT/storage/document_registry.db" "$rollback/storage/document_registry.db"
+mv "$staging/document_registry.db" "$RAG_ROOT/storage/document_registry.db"
+mv "$RAG_ROOT/knowledge-base" "$rollback/knowledge-base"
+mv "$staging/knowledge-base" "$RAG_ROOT/knowledge-base"
+mv "$RAG_ROOT/config" "$rollback/config"
+mv "$staging/config" "$RAG_ROOT/config"
+cp "$APP_ROOT/deployment/compose.production.yml" "$rollback/compose.production.yml"
+cp "$staging/deployment/compose.production.yml" "$APP_ROOT/deployment/compose.production.yml"
+
+chown -R "$RUNTIME_UID:$RUNTIME_GID" "$RAG_ROOT/storage"
+chown -R "$OPERATOR_UID:$OPERATOR_GID" "$RAG_ROOT/knowledge-base" "$RAG_ROOT/config"
+
+rm -rf -- "$staging"
+
+curl "${curl_args[@]}" -X POST \
+  "$QDRANT_URL/collections/$PRODUCTION_COLLECTION/snapshots/upload?wait=true&priority=snapshot" \
+  -F "snapshot=@$backup_dir/qdrant.snapshot"
+
+restore_completed=1
+trap - EXIT
+echo "Production restore completed. Rollback data retained at: $rollback"
+echo "Start services with: systemctl start corporate-rag.service"

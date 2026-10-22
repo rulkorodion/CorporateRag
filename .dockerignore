@@ -1,0 +1,23 @@
+.git
+.env
+.pytest_cache
+.ruff_cache
+.venv
+.venv-*
+frontend/node_modules
+frontend/.next
+__pycache__
+*.py[cod]
+*.log
+
+tests
+tmp
+storage
+rag-ocr-results-*
+rag-ocr-ambiguous-results-*
+
+# Runtime data is mounted from /opt/corporate-rag and models from /opt/models.
+База Знаний
+streamlit_app.py
+requirements-monkeyocr.txt
+requirements-ui.txt

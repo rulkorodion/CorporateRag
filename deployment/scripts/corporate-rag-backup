@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 0077
+
+RAG_ROOT="${CORPORATE_RAG_ROOT:-/opt/corporate-rag}"
+APP_ROOT="${CORPORATE_RAG_APP_ROOT:-$RAG_ROOT/app}"
+STORAGE_ROOT="${CORPORATE_RAG_STORAGE_ROOT:-$RAG_ROOT/storage}"
+BACKUP_ROOT="${CORPORATE_RAG_BACKUP_ROOT:-$RAG_ROOT/backups/production}"
+QDRANT_URL="${QDRANT_URL:-http://127.0.0.1:6333}"
+COLLECTION="${QDRANT_COLLECTION:-corporate_knowledge_chunks_v1}"
+RETENTION="${BACKUP_RETENTION:-7}"
+MIN_FREE_KB="${BACKUP_MIN_FREE_KB:-5242880}"
+LOCK_FILE="${CORPORATE_RAG_MAINTENANCE_LOCK:-/run/lock/corporate-rag-maintenance.lock}"
+
+if ! [[ "$COLLECTION" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "ERROR: invalid Qdrant collection name" >&2
+  exit 2
+fi
+if ! [[ "$RETENTION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BACKUP_RETENTION must be a positive integer" >&2
+  exit 2
+fi
+
+mkdir -p "$BACKUP_ROOT"
+chmod 0700 "$BACKUP_ROOT"
+
+available_kb="$(df -Pk "$BACKUP_ROOT" | awk 'NR==2 {print $4}')"
+if (( available_kb < MIN_FREE_KB )); then
+  echo "ERROR: less than $MIN_FREE_KB KiB free under $BACKUP_ROOT" >&2
+  exit 1
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -w 3600 9; then
+  echo "ERROR: timed out waiting for the maintenance lock" >&2
+  exit 1
+fi
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+staging="$BACKUP_ROOT/.backup-$stamp.tmp"
+target="$BACKUP_ROOT/backup-$stamp"
+snapshot_name=""
+
+curl_args=(-fsS --connect-timeout 10 --max-time 1800)
+if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+  curl_args+=(-H "api-key: ${QDRANT_API_KEY}")
+fi
+
+cleanup() {
+  local status=$?
+  if [[ -n "$snapshot_name" ]]; then
+    curl "${curl_args[@]}" -X DELETE \
+      "$QDRANT_URL/collections/$COLLECTION/snapshots/$snapshot_name" \
+      >/dev/null 2>&1 || true
+  fi
+  if [[ $status -ne 0 && -d "$staging" ]]; then
+    mv "$staging" "$BACKUP_ROOT/failed-$stamp" || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+mkdir "$staging"
+echo "Backup started at $(date --iso-8601=seconds)"
+
+curl "${curl_args[@]}" -X POST \
+  "$QDRANT_URL/collections/$COLLECTION/snapshots?wait=true" \
+  -o "$staging/qdrant-create.json"
+
+snapshot_name="$(python3 - "$staging/qdrant-create.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("status") != "ok" or not data.get("result", {}).get("name"):
+    raise SystemExit(f"Qdrant snapshot creation failed: {data}")
+print(data["result"]["name"])
+PY
+)"
+
+curl "${curl_args[@]}" \
+  "$QDRANT_URL/collections/$COLLECTION/snapshots/$snapshot_name" \
+  -o "$staging/qdrant.snapshot"
+
+python3 - "$STORAGE_ROOT/document_registry.db" "$staging/document_registry.db" <<'PY'
+import sqlite3, sys
+source = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+target = sqlite3.connect(sys.argv[2])
+source.backup(target)
+if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+    raise SystemExit("Registry backup failed SQLite integrity_check")
+target.close()
+source.close()
+PY
+
+tar -czf "$staging/runtime-data.tar.gz" \
+  -C "$RAG_ROOT" \
+  storage/normalized storage/chunks storage/assets storage/ocr
+
+tar -czf "$staging/knowledge-base.tar.gz" \
+  -C "$RAG_ROOT" knowledge-base
+
+tar -czf "$staging/config.tar.gz" \
+  -C "$RAG_ROOT" config \
+  -C "$APP_ROOT" deployment/compose.production.yml deployment/production.env.example
+
+points="$(curl "${curl_args[@]}" "$QDRANT_URL/collections/$COLLECTION" | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["result"]["points_count"])')"
+
+python3 - "$staging/manifest.json" "$stamp" "$COLLECTION" "$points" "$snapshot_name" <<'PY'
+import json, os, platform, sys
+manifest = {
+    "schema_version": "corporate-rag-backup-v1",
+    "created_at_utc": sys.argv[2],
+    "host": platform.node(),
+    "qdrant_collection": sys.argv[3],
+    "qdrant_points": int(sys.argv[4]),
+    "qdrant_snapshot_name": sys.argv[5],
+    "files": [
+        "qdrant.snapshot", "document_registry.db", "runtime-data.tar.gz",
+        "knowledge-base.tar.gz", "config.tar.gz",
+    ],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(manifest, stream, ensure_ascii=False, indent=2)
+    stream.write("\n")
+PY
+
+(
+  cd "$staging"
+  sha256sum qdrant.snapshot document_registry.db runtime-data.tar.gz \
+    knowledge-base.tar.gz config.tar.gz manifest.json > SHA256SUMS
+)
+
+chmod -R go-rwx "$staging"
+mv "$staging" "$target"
+
+curl "${curl_args[@]}" -X DELETE \
+  "$QDRANT_URL/collections/$COLLECTION/snapshots/$snapshot_name" >/dev/null
+snapshot_name=""
+
+mapfile -t backups < <(
+  find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name 'backup-[0-9]*T[0-9]*Z' -printf '%f\n' | sort -r
+)
+for ((index=RETENTION; index<${#backups[@]}; index++)); do
+  expired="$BACKUP_ROOT/${backups[$index]}"
+  if [[ "$expired" == "$BACKUP_ROOT"/backup-* && -d "$expired" ]]; then
+    rm -rf -- "$expired"
+    echo "Expired backup removed: $expired"
+  fi
+done
+
+trap - EXIT
+echo "Backup completed: $target"
+du -sh "$target"

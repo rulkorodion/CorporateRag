@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_ROOT="${CORPORATE_RAG_APP_ROOT:-/opt/corporate-rag/app}"
+ENV_FILE="${CORPORATE_RAG_ENV_FILE:-/opt/corporate-rag/config/production.env}"
+COMPOSE_FILE="$APP_ROOT/deployment/compose.production.yml"
+OLLAMA_DROPIN_DIR=/etc/systemd/system/ollama.service.d
+OLLAMA_DROPIN="$OLLAMA_DROPIN_DIR/zz-corporate-rag-performance.conf"
+LEGACY_OLLAMA_DROPIN="$OLLAMA_DROPIN_DIR/30-corporate-rag-performance.conf"
+BACKUP_ROOT=/opt/corporate-rag/backups/performance-profiles
+LOCK_FILE=/run/lock/corporate-rag-maintenance.lock
+
+usage() {
+  echo "Usage: corporate-rag-performance-profile show|apply <1-1-1|1-1-2|2-1-1|2-2-1|2-2-2>|rollback <backup-dir>" >&2
+}
+
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Run with sudo." >&2
+    exit 1
+  fi
+}
+
+set_env() {
+  local key=$1 value=$2 temporary
+  temporary=$(mktemp "${ENV_FILE}.XXXXXX")
+  awk -F= -v key="$key" -v value="$value" '
+    BEGIN { replaced = 0 }
+    $1 == key { print key "=" value; replaced = 1; next }
+    { print }
+    END { if (!replaced) print key "=" value }
+  ' "$ENV_FILE" >"$temporary"
+  chown --reference="$ENV_FILE" "$temporary"
+  chmod --reference="$ENV_FILE" "$temporary"
+  mv -f "$temporary" "$ENV_FILE"
+}
+
+wait_http() {
+  local url=$1 attempts=${2:-120}
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if curl -fsS "$url" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Timed out waiting for $url" >&2
+  return 1
+}
+
+show_profile() {
+  grep -E '^(API_EMBEDDING_CONCURRENCY|API_RERANKER_CONCURRENCY|API_LLM_CONCURRENCY|OLLAMA_NUM_PARALLEL)=' "$ENV_FILE" || true
+  systemctl show ollama -p Environment --no-pager | tr ' ' '\n' | grep '^OLLAMA_NUM_PARALLEL=' || true
+}
+
+apply_profile() {
+  local profile=$1 embedding reranker llm ollama stamp backup
+  case "$profile" in
+    1-1-1) embedding=1; reranker=1; llm=1; ollama=1 ;;
+    1-1-2) embedding=1; reranker=1; llm=2; ollama=2 ;;
+    2-1-1) embedding=2; reranker=1; llm=1; ollama=1 ;;
+    2-2-1) embedding=2; reranker=2; llm=1; ollama=1 ;;
+    2-2-2) embedding=2; reranker=2; llm=2; ollama=2 ;;
+    *) usage; exit 2 ;;
+  esac
+
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  backup="$BACKUP_ROOT/$stamp-before-$profile"
+  install -d -m 0700 "$backup"
+  cp -a "$ENV_FILE" "$backup/production.env"
+  if [[ -f $OLLAMA_DROPIN ]]; then
+    cp -a "$OLLAMA_DROPIN" "$backup/ollama-parallel.conf"
+  else
+    : >"$backup/ollama-dropin-was-absent"
+  fi
+
+  set_env API_EMBEDDING_CONCURRENCY "$embedding"
+  set_env API_RERANKER_CONCURRENCY "$reranker"
+  set_env API_LLM_CONCURRENCY "$llm"
+  set_env OLLAMA_NUM_PARALLEL "$ollama"
+  install -d -m 0755 "$OLLAMA_DROPIN_DIR"
+  printf '[Service]\nEnvironment=OLLAMA_NUM_PARALLEL=%s\n' "$ollama" >"$OLLAMA_DROPIN"
+  rm -f "$LEGACY_OLLAMA_DROPIN"
+
+  systemctl daemon-reload
+  systemctl restart ollama
+  wait_http http://127.0.0.1:11434/api/tags
+  docker compose -f "$COMPOSE_FILE" up -d --force-recreate rag-api
+  wait_http http://127.0.0.1:8010/ready 180
+  echo "Applied profile: $profile"
+  echo "Rollback directory: $backup"
+  show_profile
+}
+
+rollback_profile() {
+  local backup=$1
+  test -f "$backup/production.env"
+  cp -a "$backup/production.env" "$ENV_FILE"
+  if [[ -f $backup/ollama-dropin-was-absent ]]; then
+    rm -f "$OLLAMA_DROPIN"
+  else
+    cp -a "$backup/ollama-parallel.conf" "$OLLAMA_DROPIN"
+  fi
+  rm -f "$LEGACY_OLLAMA_DROPIN"
+  systemctl daemon-reload
+  systemctl restart ollama
+  wait_http http://127.0.0.1:11434/api/tags
+  docker compose -f "$COMPOSE_FILE" up -d --force-recreate rag-api
+  wait_http http://127.0.0.1:8010/ready 180
+  echo "Rolled back from: $backup"
+  show_profile
+}
+
+command=${1:-}
+case "$command" in
+  show)
+    show_profile
+    ;;
+  apply)
+    require_root
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    exec 8>"$LOCK_FILE"
+    flock -n 8 || { echo "Another Corporate RAG maintenance job is active." >&2; exit 1; }
+    apply_profile "$2"
+    ;;
+  rollback)
+    require_root
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    exec 8>"$LOCK_FILE"
+    flock -n 8 || { echo "Another Corporate RAG maintenance job is active." >&2; exit 1; }
+    rollback_profile "$2"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

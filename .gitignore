@@ -1,0 +1,21 @@
+.env
+frontend/.env.local
+.venv/
+.venv-retrieval/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+storage/
+tmp/
+frontend/.npm-cache/
+frontend/node_modules/
+frontend/.next/
+frontend/.admin-upload/
+frontend/tsconfig.tsbuildinfo
+*.log
+
+# Corporate source documents and generated OCR output must never be published.
+База Знаний/
+rag-ocr-results-*/
+rag-ocr-ambiguous-results-*/

@@ -58,7 +58,7 @@ Ollama LLM → FastAPI → Next.js → Nginx
 
 ## Быстрый запуск для разработки
 
-### Backend
+### Бэкенд
 
 ```powershell
 git clone https://github.com/rulkorodion/CorporateRag.git
@@ -78,7 +78,7 @@ Copy-Item .env.example .env
 
 API по умолчанию доступен на `http://127.0.0.1:8010`.
 
-### Frontend
+### Фронтенд
 
 ```powershell
 cd frontend
@@ -124,19 +124,19 @@ npm.cmd run dev
 ## Тесты
 
 ```powershell
-# Backend
+# Бэкенд
 .\.venv\Scripts\python.exe -m pytest
 
-# Frontend
+# Фронтенд
 cd frontend
 npm.cmd test
 npm.cmd run typecheck
 npm.cmd run build
 ```
 
-## Production-развёртывание
+## Развёртывание на сервере
 
-Production-схема описана в [`deployment/compose.production.yml`](deployment/compose.production.yml). Она запускает:
+Серверная схема описана в [`deployment/compose.production.yml`](deployment/compose.production.yml). Она запускает:
 
 - `rag-api` — FastAPI, embedding и reranker;
 - `rag-frontend` — Next.js;
@@ -178,7 +178,7 @@ curl -sS -o /dev/null -w 'ONLYOFFICE HTTP %{http_code}\n' http://127.0.0.1:3001/
 
 ## Документация
 
-- [Production deployment](deployment/README.md)
-- [Runbook](deployment/RUNBOOK.md)
+- [Развёртывание на сервере](deployment/README.md)
+- [Регламент эксплуатации](deployment/RUNBOOK.md)
 - [Графики прокатов](deployment/ROLLING_SCHEDULES.md)
 - [Настройки окружения](.env.example)

@@ -1,9 +1,8 @@
-# Corporate RAG production runbook
+# Регламент эксплуатации Corporate RAG
 
-Production root: `/opt/corporate-rag`; Compose file:
-`/opt/corporate-rag/app/deployment/compose.production.yml`.
+Корневой каталог production: `/opt/corporate-rag`. Compose-файл: `/opt/corporate-rag/app/deployment/compose.production.yml`.
 
-## Daily checks
+## Ежедневная проверка
 
 ```bash
 cd /opt/corporate-rag/app
@@ -11,28 +10,28 @@ sudo docker compose -f deployment/compose.production.yml ps
 curl -fsS http://127.0.0.1:8010/health | python3 -m json.tool
 curl -fsS http://127.0.0.1:8010/ready | python3 -m json.tool
 curl -fsS -o /dev/null -w 'frontend HTTP %{http_code}\n' http://127.0.0.1:3001/
+curl -fsS -o /dev/null -w 'ONLYOFFICE HTTP %{http_code}\n' \
+  http://127.0.0.1:3001/onlyoffice/healthcheck
 nvidia-smi
 df -h /
 ```
 
-API and frontend logs are bounded by the Compose `local` logging driver
-(`20m` per file, five files per container):
+Ожидаемый результат: все четыре контейнера имеют статус `healthy`, `/ready` возвращает `"ready": true`, а frontend и ONLYOFFICE — HTTP 200.
+
+## Логи
+
+Compose использует logging driver `local`: до 20 МБ на файл и пять файлов на контейнер.
 
 ```bash
 sudo docker compose -f deployment/compose.production.yml logs --tail=200 rag-api
 sudo docker compose -f deployment/compose.production.yml logs --tail=200 rag-frontend
+sudo docker compose -f deployment/compose.production.yml logs --tail=200 rag-gateway
 sudo journalctl -u corporate-rag-update.service -n 100 --no-pager
 sudo journalctl -u corporate-rag-backup.service -n 100 --no-pager
 sudo journalctl -u corporate-rag-upload.service -n 100 --no-pager
 ```
 
-Inspect the active Stage 13 concurrency profile without changing it:
-
-```bash
-sudo corporate-rag-performance-profile show
-```
-
-## Dependencies
+## Внешние зависимости
 
 ```bash
 curl -fsS http://127.0.0.1:6333/collections/corporate_knowledge_chunks_v1 |
@@ -42,13 +41,11 @@ systemctl is-enabled ollama
 sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' qdrant
 ```
 
-Qdrant and Ollama are existing server services. Do not recreate them from the
-Corporate RAG Compose project.
+Qdrant и Ollama уже существуют на сервере. Их нельзя пересоздавать из Compose-проекта Corporate RAG.
 
-## Incremental update
+## Инкрементальное обновление
 
-Hourly runs are serialized by `/run/lock/corporate-rag-maintenance.lock`.
-The pipeline also keeps its own data lock. A no-change run exits quickly.
+Почасовые запуски сериализуются через `/run/lock/corporate-rag-maintenance.lock`. Сам pipeline имеет дополнительную data-lock и быстро завершается, если изменений нет.
 
 ```bash
 systemctl list-timers --all 'corporate-rag-*'
@@ -57,45 +54,31 @@ sudo systemctl status corporate-rag-update.service --no-pager
 sudo journalctl -u corporate-rag-update.service -n 100 --no-pager
 ```
 
-## Editor uploads
+## Загрузка файлов редактором
 
-The editor opens `/admin` on the same frontend address. Uploaded bytes are
-limited to the isolated queue; only the host promotion service writes to the
-knowledge-base source tree.
+Админка открывается по пути `/admin`. Загруженные байты остаются в изолированной очереди; только host service может перенести проверенный файл в source tree.
 
 ```bash
 systemctl status corporate-rag-upload.path --no-pager
 sudo journalctl -u corporate-rag-upload.service -n 100 --no-pager
-sudo find /opt/corporate-rag/admin-upload/queue -mindepth 1 -maxdepth 2 -type f
+sudo find /opt/corporate-rag/admin-upload/queue \
+  -mindepth 1 -maxdepth 2 -type f
 ```
 
-Change the shared editor password without rebuilding the image:
+Смена пароля без пересборки образа:
 
 ```bash
 sudo corporate-rag-admin-credentials editor
 cd /opt/corporate-rag/app
-sudo docker compose -f deployment/compose.production.yml up -d --force-recreate rag-frontend
+sudo docker compose -f deployment/compose.production.yml \
+  up -d --force-recreate rag-frontend
 ```
 
-Automatic upload processing is debounced for 30 seconds. The upload service
-and hourly updater share `/run/lock/corporate-rag-maintenance.lock`, so OCR,
-embedding, backup, and restore jobs cannot overlap.
+Обработка upload-очереди имеет debounce 30 секунд. Upload service и updater используют общую maintenance-блокировку, поэтому OCR, embedding, backup и restore не пересекаются.
 
-To preview changes without writing anything:
+## Резервное копирование
 
-```bash
-cd /opt/corporate-rag/app
-sudo docker compose -f deployment/compose.production.yml --profile update run --rm \
-  rag-update python -m corporate_rag_ingestion update --dry-run --json
-```
-
-## Backup and restore
-
-A daily timer keeps the newest seven backups under
-`/opt/corporate-rag/backups/production`. Every backup contains a native Qdrant
-snapshot, a consistent SQLite registry copy, runtime artifacts, source files,
-and recovery configuration. Backup directories are mode `0700` because the
-configuration may contain secrets.
+Ежедневный timer хранит семь последних полных копий в `/opt/corporate-rag/backups/production`. Каждая копия включает нативный Qdrant snapshot, согласованную копию SQLite, runtime-данные, исходные файлы и recovery-конфигурацию. Каталоги имеют режим `0700`.
 
 ```bash
 sudo systemctl start corporate-rag-backup.service
@@ -103,56 +86,54 @@ sudo journalctl -u corporate-rag-backup.service -n 100 --no-pager
 sudo ls -ld /opt/corporate-rag/backups/production/backup-*
 ```
 
-Verify or test the latest backup without touching production:
+Проверка последней копии без влияния на production:
 
 ```bash
-latest=$(sudo find /opt/corporate-rag/backups/production -mindepth 1 -maxdepth 1 \
-  -type d -name 'backup-*' -printf '%p\n' | sort | tail -1)
+latest=$(sudo find /opt/corporate-rag/backups/production \
+  -mindepth 1 -maxdepth 1 -type d -name 'backup-*' \
+  -printf '%p\n' | sort | tail -1)
 sudo corporate-rag-restore verify "$latest"
 sudo corporate-rag-restore test "$latest"
 ```
 
-The test restore creates a temporary Qdrant collection, compares its point
-count with the manifest, and deletes that test collection.
+Test restore создаёт временную Qdrant-коллекцию, сверяет point count с манифестом и удаляет тестовую коллекцию.
 
-Production restore is deliberately guarded and requires downtime:
+## Восстановление
+
+Восстановление production требует остановки сервиса и явного флага подтверждения:
 
 ```bash
 sudo systemctl stop corporate-rag.service
 cd /opt/corporate-rag/app
-sudo docker compose -f deployment/compose.production.yml stop rag-api rag-frontend
+sudo docker compose -f deployment/compose.production.yml \
+  stop rag-api rag-frontend
 sudo corporate-rag-restore production "$latest" --confirm-production
 sudo systemctl start corporate-rag.service
 ```
 
-The replaced filesystem data is retained under
-`/opt/corporate-rag/restore-rollback/<timestamp>`.
+Заменённые файловые данные сохраняются в `/opt/corporate-rag/restore-rollback/<timestamp>`.
 
-## Restart and recovery
+## Перезапуск и boot recovery
 
 ```bash
 sudo systemctl restart corporate-rag.service
-sudo docker compose -f /opt/corporate-rag/app/deployment/compose.production.yml \
+sudo systemctl status corporate-rag.service --no-pager -l
+sudo docker compose \
+  -f /opt/corporate-rag/app/deployment/compose.production.yml \
   restart rag-api rag-frontend
-sudo systemctl status corporate-rag.service --no-pager
 ```
 
-`corporate-rag.service` waits for Qdrant and Ollama, starts API/frontend, and
-does not perform indexing. It is enabled for boot. The update and backup timers
-are persistent, so a missed scheduled run is executed after the server returns.
+`corporate-rag.service` ждёт Qdrant и Ollama, после чего запускает API и frontend. Индексация при boot не выполняется. Persistent timers догоняют пропущенные update и backup после возврата сервера.
 
-## If `/ready` is false
+## Если `/ready` возвращает `false`
 
-1. Read the JSON response and identify `qdrant`, `ollama`, `embedding`, or
-   `reranker`.
-2. Check `nvidia-smi`, free disk, API logs, Qdrant, and Ollama endpoints.
-3. Verify the two model paths under `/opt/models` still exist.
-4. Restart only `rag-api`; do not reindex unless the collection is actually
-   missing or damaged.
-5. If startup still fails, restore the latest verified backup or roll the app
-   directory back to `/opt/corporate-rag/backups/app-before-<stage>-<timestamp>`.
+1. По JSON-ответу определить неготовый компонент: `qdrant`, `ollama`, `embedding` или `reranker`.
+2. Проверить `nvidia-smi`, свободное место, API-логи, Qdrant и Ollama.
+3. Убедиться, что каталоги embedding и reranker в `/opt/models` существуют.
+4. Перезапустить только `rag-api`. Не переиндексировать данные, если коллекция не повреждена.
+5. Если запуск по-прежнему невозможен, использовать последнюю проверенную backup-копию или откат кода.
 
-## If disk space is low
+## Если заканчивается место
 
 ```bash
 df -h /
@@ -161,11 +142,9 @@ sudo du -sh /opt/corporate-rag/backups/production/* 2>/dev/null | sort -h
 sudo journalctl --disk-usage
 ```
 
-First remove only expired Corporate RAG backups after confirming a newer
-verified backup exists. Docker image/build-cache cleanup is a separate operator
-decision; never remove volumes and never delete Qdrant storage manually.
+Сначала можно удалять только просроченные backup-копии, убедившись в наличии более новой проверенной копии. Очистка Docker images/build cache — отдельное решение. Volumes и Qdrant storage удалять нельзя.
 
-## Security checks
+## Проверка безопасности
 
 ```bash
 sudo ss -lntp | grep -E ':(3001|8010|6333|11434)\b'
@@ -173,10 +152,8 @@ sudo docker inspect corporate-rag-api corporate-rag-frontend \
   --format '{{.Name}} privileged={{.HostConfig.Privileged}} readonly={{.HostConfig.ReadonlyRootfs}} log={{.HostConfig.LogConfig.Type}}'
 ```
 
-API stays on loopback. The browser talks only to the Next.js frontend; Next.js
-proxies API/file requests. Qdrant and Ollama must not be reachable from employee
-networks. Until IT publishes the frontend port, use an SSH tunnel:
+API, Qdrant и Ollama должны оставаться на loopback. Браузер обращается только к Next.js/Nginx. Для временного операторского доступа можно использовать SSH-туннель:
 
 ```powershell
-ssh -N -L 3001:127.0.0.1:3001 rulko@ktzai.ktzholding.ru
+ssh -N -L 3001:127.0.0.1:3001 user@server.example.com
 ```

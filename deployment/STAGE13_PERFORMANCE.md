@@ -1,11 +1,12 @@
-# Stage 13 Performance deployment and A/B runbook
+# Нагрузочное тестирование и A/B-профили
 
-All measurements below must be run on the production-like server. Local test
-results do not substitute for server measurements.
+> Этот файл сохраняет воспроизводимую методику подбора production-параметров. Указанные теги образов относятся к тому этапу измерений. Для текущего развёртывания нужно использовать теги из `compose.production.yml`.
 
-## Build and transfer
+Все замеры выполняются на production-like сервере. Локальные результаты не заменяют серверные.
 
-Run in Windows PowerShell from the project directory:
+## Сборка и передача архива
+
+Из каталога проекта в Windows PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass `
@@ -13,12 +14,10 @@ powershell -ExecutionPolicy Bypass `
   -SkipKnowledgeBase
 Get-FileHash .\tmp\corporate-rag-stage13-performance.tar.gz -Algorithm SHA256
 scp .\tmp\corporate-rag-stage13-performance.tar.gz `
-  rulko@ktzai.ktzholding.ru:/tmp/
+  user@server.example.com:/tmp/
 ```
 
-## Deploy with rollback
-
-Run on the server:
+## Развёртывание с возможностью отката
 
 ```bash
 cd /opt/corporate-rag
@@ -43,10 +42,9 @@ sudo docker compose -f deployment/compose.production.yml \
   up -d --force-recreate rag-frontend
 ```
 
-The profile command prints its exact settings-backup directory. Keep that path
-for rollback.
+Команда профиля выводит каталог резервной копии настроек. Этот путь нужно сохранить для отката.
 
-## Readiness and streaming smoke test
+## Проверка готовности и потока
 
 ```bash
 curl -fsS http://127.0.0.1:8010/health | python3 -m json.tool
@@ -60,20 +58,18 @@ curl -fsS -N \
   | tee /tmp/stage13-stream-smoke.ndjson
 ```
 
-The stream must contain `status`, one or more `delta` records, and one `final`
-record. Only `final.data` is the validated answer.
+В потоке должны быть `status`, один или несколько `delta` и один `final`. Только `final.data` считается проверенным ответом.
 
-## Concurrency A/B
+## A/B-тест параллелизма
 
-Create the report directory once:
+Каталог отчётов создаётся один раз:
 
 ```bash
 sudo install -d -o 10001 -g 10001 -m 0750 \
   /opt/corporate-rag/storage/reports/performance-stage13
 ```
 
-For each profile, apply it, warm Ollama outside the measurement, then run the
-same workload:
+Для каждого профиля нужно применить его, прогреть Ollama вне измерения и запустить одинаковую нагрузку:
 
 ```bash
 mode=1-1-1
@@ -93,20 +89,9 @@ sudo docker run --rm --network host --gpus all \
   --users 1 2 5 10 \
   --requests 20 \
   --output "/reports/concurrency-$mode.json"
-
-sudo docker logs --since 30m corporate-rag-api 2>&1 \
-  | grep -Ei 'traceback|exception|cuda error|out of memory|permission denied' \
-  | tail -50 \
-  | sudo tee "/opt/corporate-rag/storage/reports/performance-stage13/errors-$mode.txt" \
-  >/dev/null || true
-sudo journalctl -u ollama --since '30 minutes ago' --no-pager -o cat \
-  | grep -Ei 'error|failed|panic|out of memory|cuda' \
-  | tail -50 \
-  | sudo tee "/opt/corporate-rag/storage/reports/performance-stage13/ollama-errors-$mode.txt" \
-  >/dev/null || true
 ```
 
-Repeat with only `mode` changed, in this order:
+Профили проверяются в одинаковом порядке:
 
 ```bash
 mode=1-1-1
@@ -116,17 +101,15 @@ mode=2-2-1
 mode=2-2-2
 ```
 
-`2-2-2` sets API LLM concurrency and `OLLAMA_NUM_PARALLEL` to two together.
-On OOM, CUDA error, or failed readiness, return immediately to baseline:
+`2-2-2` одновременно устанавливает API LLM concurrency и `OLLAMA_NUM_PARALLEL=2`. При OOM, CUDA error или неготовном `/ready` нужно сразу вернуть baseline:
 
 ```bash
 sudo corporate-rag-performance-profile apply 1-1-1
 ```
 
-## Context budget A/B
+## A/B-тест бюджета контекста
 
-Run after choosing one stable concurrency profile. These are per-request
-overrides and do not edit the production default:
+После выбора стабильного профиля параллелизма проверяются per-request бюджеты. Production default не меняется:
 
 ```bash
 for budget in 6000 5000 4000; do
@@ -136,21 +119,16 @@ for budget in 6000 5000 4000; do
     python /app/tools/load_test_api.py \
     --base-url http://127.0.0.1:8010 \
     --mode "context-$budget" \
-    --users 1 \
-    --requests 10 \
+    --users 1 --requests 10 \
     --max-context-tokens "$budget" \
     --include-answer-text \
     --output "/reports/context-$budget.json"
 done
 ```
 
-Review `prompt_estimate_ratio`, actual `prompt_eval_count`, citations, source
-paths, and answer completeness. The production default stays 6000 until this
-review is complete.
+Нужно сравнивать `prompt_estimate_ratio`, `prompt_eval_count`, ссылки на источники и полноту ответа. До завершения этой проверки default остаётся 6000.
 
-## Output budget A/B
-
-This is a separate experiment; no context override is supplied:
+## A/B-тест лимита ответа
 
 ```bash
 for limit in 512 1024 2048; do
@@ -160,19 +138,16 @@ for limit in 512 1024 2048; do
     python /app/tools/load_test_api.py \
     --base-url http://127.0.0.1:8010 \
     --mode "output-$limit" \
-    --users 1 \
-    --requests 10 \
+    --users 1 --requests 10 \
     --num-predict "$limit" \
     --include-answer-text \
     --output "/reports/output-$limit.json"
 done
 ```
 
-`done_reason=length`, an incomplete sentence, worse citation validation, or
-missing steps means the limit is too small. The default remains unlimited
-until the real results justify a cap.
+`done_reason=length`, оборванное предложение, ухудшение валидации ссылок или пропущенные шаги означают, что лимит слишком мал. Без реальных измерений output cap не вводится.
 
-## Summarize and transfer the actual results
+## Сводка и выгрузка результатов
 
 ```bash
 sudo docker run --rm \
@@ -184,13 +159,9 @@ sudo tar -czf /tmp/corporate-rag-stage13-results.tar.gz \
   -C /opt/corporate-rag/storage/reports performance-stage13
 ```
 
-Copy `/tmp/corporate-rag-stage13-results.tar.gz` to the workstation. Those
-reports, not assumptions, determine the final profile and budgets.
+Итоговые профили и бюджеты выбираются по этим отчётам, а не по предположениям.
 
-## Rollback
-
-Restore the settings backup printed by the first profile command, then the
-previous app directory:
+## Откат
 
 ```bash
 sudo corporate-rag-performance-profile rollback \
